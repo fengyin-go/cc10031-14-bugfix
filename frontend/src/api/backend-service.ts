@@ -106,3 +106,107 @@ export async function loadRecoveryStats(): Promise<Record<string, unknown>> {
   if (!response.ok) throw new Error('恢复状态查询失败')
   return await response.json()
 }
+
+// ---- 补全工作台 / 补全二次校验（14 号处理） ----
+
+export type EnrichWorkbenchItem = {
+  entry_id: number
+  batch_ref: string
+  enrich_version: number
+  enriched_at: string | null
+  rewritten_fields: string[]
+  rewrite_diff: Record<string, { old: unknown; new: unknown }>
+  validation_status: string
+  validation_version: number
+  validated: boolean
+  quality_score: number | null
+  stale_receipt: boolean
+}
+
+export type EnrichWorkbench = {
+  batch_ref: string | null
+  item_no: number
+  item: string
+  count: number
+  pending_revalidation: number
+  items: EnrichWorkbenchItem[]
+}
+
+export type RevalidationRecord = {
+  entry_id: number
+  enrich_version: number
+  rewritten_fields: string[]
+  validation_status: string
+  validated: boolean
+  quality_score: number | null
+  failed_rules: string[]
+}
+
+export type RevalidationReport = {
+  batch_ref: string
+  item_no: number
+  item: string
+  terminal_state: string
+  failed_rule_hits: Record<string, number>
+  records: RevalidationRecord[]
+  consistency: { consistent: boolean; stale_conclusions: unknown[] }
+}
+
+export type RevalidationResult = {
+  ok: boolean
+  batch_ref: string
+  item_no: number
+  item: string
+  mode: string
+  terminal_state: string
+  revalidated: number
+  passed: number
+  failed: number
+  conflicts: number
+  consistency: { consistent: boolean; stale_conclusions: unknown[] }
+  message?: string
+}
+
+/** 按批次检索补全后的字段改写、校验状态与补全版本 */
+export async function loadEnrichWorkbench(batchRef: string): Promise<EnrichWorkbench> {
+  const query = batchRef ? `?batch_ref=${encodeURIComponent(batchRef)}` : ''
+  const response = await request(`/api/enrich/workbench${query}`)
+  if (!response.ok) throw new Error('补全工作台读取失败')
+  return await response.json()
+}
+
+/** 执行补全（字段改写与校验失效同步发生） */
+export async function runEnrich(batchRef: string): Promise<Record<string, unknown>> {
+  const response = await request(
+    `/api/enrich/execute?batch_ref=${encodeURIComponent(batchRef)}`,
+    { method: 'POST' },
+  )
+  const payload = await response.json()
+  if (!response.ok) throw new Error('补全执行失败')
+  return payload
+}
+
+/** 补全二次校验：incremental 只重算被改写记录，full_batch 整批重校验 */
+export async function runRevalidation(
+  batchRef: string,
+  mode: 'incremental' | 'full_batch',
+): Promise<RevalidationResult> {
+  const response = await request(
+    `/api/enrich/revalidate?batch_ref=${encodeURIComponent(batchRef)}&mode=${mode}`,
+    { method: 'POST' },
+  )
+  const payload = await response.json()
+  if (!response.ok) throw new Error('补全二次校验失败')
+  return payload
+}
+
+/** 结果校验工作台：定位具体失败规则 */
+export async function loadRevalidationReport(
+  batchRef: string,
+): Promise<RevalidationReport> {
+  const response = await request(
+    `/api/enrich/revalidation-report?batch_ref=${encodeURIComponent(batchRef)}`,
+  )
+  if (!response.ok) throw new Error('结果校验台账读取失败')
+  return await response.json()
+}

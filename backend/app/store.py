@@ -7,6 +7,7 @@
 - DirtyDataVault: 脏数据隔离区，存储校验不通过/解析失败的脏数据记录
 - FailureRecovery: 失败恢复管理器，记录失败步骤并支持重试
 - CollectRecord: 采集记录存储，记录每次采集产出的结构化数据
+- ValidationReceipt: 补全校验回执台账，校验结论与补全版本绑定
 """
 from __future__ import annotations
 
@@ -203,6 +204,20 @@ class DirtyDataVault:
 # 采集记录 (CollectRecord) — 每次采集产出的结构化数据
 # ---------------------------------------------------------------------------
 
+# 补全二次校验的处理项编号与终态。冲突会改变 14 号处理的终态，
+# 未通过时也不能退回“补全前通过”的旧结论。
+ENRICH_REVALIDATION_NO = 14
+ENRICH_REVALIDATION_ITEM = "补全二次校验"
+TERMINAL_PASSED = "已复验通过"
+TERMINAL_FAILED = "复验未通过"
+TERMINAL_CONFLICT = "版本冲突"
+STATUS_NOT_VALIDATED = "未校验"
+STATUS_VALIDATED = "已校验"
+STATUS_PENDING_REVALIDATION = "待复验"
+STATUS_REVALIDATION_FAILED = "复验未通过"
+STATUS_CONFLICT = "校验冲突"
+
+
 @dataclass
 class CollectEntry:
     entry_id: int
@@ -211,11 +226,186 @@ class CollectEntry:
     fields: dict[str, Any]
     collected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     validated: bool = False
-    quality_score: float = 1.0
+    quality_score: float | None = None
+    # 补全版本：0 表示从未发生补全；每次真正改写字段才 +1。
+    enrich_version: int = 0
+    enriched_at: str | None = None
+    # 当前补全版本实际改写的字段及其新旧值。
+    rewritten_fields: list[str] = field(default_factory=list)
+    rewrite_diff: dict[str, dict[str, Any]] = field(default_factory=dict)
+    rewrite_history: list[dict[str, Any]] = field(default_factory=list)
+    # 校验状态必须与补全版本绑定，不能只靠一个布尔标记。
+    validation_status: str = STATUS_NOT_VALIDATED
+    validation_version: int = 0
+    validation_receipt: dict[str, Any] | None = None
+    conflict: bool = False
+
+    @property
+    def pending_revalidation(self) -> bool:
+        return self.validation_status == STATUS_PENDING_REVALIDATION
+
+    def _reset_validation(self) -> None:
+        self.validated = False
+        self.quality_score = None
+        self.validation_receipt = None
+        self.validation_status = STATUS_PENDING_REVALIDATION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry_id": self.entry_id,
+            "batch_ref": self.batch_ref,
+            "source_module": self.source_module,
+            "fields": dict(self.fields),
+            "collected_at": self.collected_at,
+            "validated": self.validated,
+            "quality_score": self.quality_score,
+            "enrich_version": self.enrich_version,
+            "enriched_at": self.enriched_at,
+            "rewritten_fields": list(self.rewritten_fields),
+            "rewrite_diff": {k: dict(v) for k, v in self.rewrite_diff.items()},
+            "validation_status": self.validation_status,
+            "validation_version": self.validation_version,
+            "conflict": self.conflict,
+        }
+
+
+@dataclass
+class EnrichValidationReceipt:
+    """补全校验回执：把一次校验结论钉死在某一个补全版本上。
+
+    同一条采集记录只保留一份 effective 回执，字段一旦再次被补全改写，
+    旧回执立即 superseded，绝不允许“旧字段配新校验分”。
+    """
+    receipt_id: int
+    entry_id: int
+    batch_ref: str
+    enrich_version: int
+    source: str
+    passed: bool
+    score: float
+    rules_applied: list[dict[str, Any]]
+    failures: list[dict[str, Any]]
+    reason: str
+    rewritten_fields: list[str] = field(default_factory=list)
+    status: str = "effective"  # effective | superseded | conflict
+    superseded_by: int | None = None
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "entry_id": self.entry_id,
+            "batch_ref": self.batch_ref,
+            "enrich_version": self.enrich_version,
+            "source": self.source,
+            "passed": self.passed,
+            "score": self.score,
+            "rules_applied": list(self.rules_applied),
+            "failures": list(self.failures),
+            "reason": self.reason,
+            "rewritten_fields": list(self.rewritten_fields),
+            "status": self.status,
+            "superseded_by": self.superseded_by,
+            "created_at": self.created_at,
+        }
+
+
+class ValidationReceiptStore:
+    """校验回执台账：每条记录同一时刻只有当前补全版本对应的那份回执有效。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._receipts: list[EnrichValidationReceipt] = []
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._receipts)
+
+    def issue(
+        self,
+        *,
+        entry_id: int,
+        batch_ref: str,
+        enrich_version: int,
+        source: str,
+        passed: bool,
+        score: float,
+        rules_applied: list[dict[str, Any]],
+        failures: list[dict[str, Any]],
+        reason: str,
+        rewritten_fields: list[str] | None = None,
+    ) -> EnrichValidationReceipt:
+        with self._lock:
+            # 新回执生效前，同记录的旧回执全部作废，保证只留一份有效回执。
+            for old in self._receipts:
+                if old.entry_id == entry_id and old.status == "effective":
+                    old.status = "superseded"
+            self._seq += 1
+            receipt = EnrichValidationReceipt(
+                receipt_id=self._seq,
+                entry_id=entry_id,
+                batch_ref=batch_ref,
+                enrich_version=enrich_version,
+                source=source,
+                passed=passed,
+                score=score,
+                rules_applied=list(rules_applied),
+                failures=list(failures),
+                reason=reason,
+                rewritten_fields=list(rewritten_fields or []),
+            )
+            self._receipts.append(receipt)
+            return receipt
+
+    def supersede_for_entry(self, entry_id: int, *, superseded_by: int | None = None,
+                            only_versions_lt: int | None = None) -> list[int]:
+        """字段被改写时作废旧回执，返回被作废的回执号。"""
+        with self._lock:
+            superseded: list[int] = []
+            for receipt in self._receipts:
+                if receipt.entry_id != entry_id or receipt.status != "effective":
+                    continue
+                if only_versions_lt is not None and receipt.enrich_version >= only_versions_lt:
+                    continue
+                receipt.status = "superseded"
+                receipt.superseded_by = superseded_by
+                superseded.append(receipt.receipt_id)
+            return superseded
+
+    def active_for(self, entry_id: int) -> EnrichValidationReceipt | None:
+        with self._lock:
+            for receipt in reversed(self._receipts):
+                if receipt.entry_id == entry_id and receipt.status == "effective":
+                    return receipt
+            return None
+
+    def list_by_entry(self, entry_id: int) -> list[EnrichValidationReceipt]:
+        with self._lock:
+            return [r for r in self._receipts if r.entry_id == entry_id]
+
+    def list_by_batch(self, batch_ref: str) -> list[EnrichValidationReceipt]:
+        with self._lock:
+            return [r for r in self._receipts if r.batch_ref == batch_ref]
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            effective = sum(1 for r in self._receipts if r.status == "effective")
+            return {
+                "total": len(self._receipts),
+                "effective": effective,
+                "superseded": sum(1 for r in self._receipts if r.status == "superseded"),
+                "conflict": sum(1 for r in self._receipts if r.status == "conflict"),
+            }
 
 
 class CollectRecordStore:
     """采集记录存储：每次采集流程产出的结构化数据行。
+
+    字段改写与校验失效在同一把锁内完成：一旦补全真正改了字段，
+    ``enrich_version`` 立即 +1，``validated``/``quality_score`` 同步清空，
+    旧校验回执同步作废，避免下游把补全后的记录当成补全前的已验证数据。
 
     用法::
 
@@ -227,6 +417,10 @@ class CollectRecordStore:
         self._lock = threading.Lock()
         self._seq = 0
         self._entries: list[CollectEntry] = []
+        self._receipts: ValidationReceiptStore | None = None
+
+    def attach_receipt_store(self, receipts: ValidationReceiptStore) -> None:
+        self._receipts = receipts
 
     @property
     def count(self) -> int:
@@ -244,6 +438,13 @@ class CollectRecordStore:
             self._entries.append(entry)
             return entry
 
+    def get(self, entry_id: int) -> CollectEntry | None:
+        with self._lock:
+            for entry in self._entries:
+                if entry.entry_id == entry_id:
+                    return entry
+            return None
+
     def list_by_batch(self, batch_ref: str) -> list[CollectEntry]:
         with self._lock:
             return [e for e in self._entries if e.batch_ref == batch_ref]
@@ -252,18 +453,201 @@ class CollectRecordStore:
         with self._lock:
             return [e for e in self._entries if e.source_module == source]
 
-    def mark_validated(self, entry_id: int, score: float = 1.0) -> bool:
+    def list_enriched(self, batch_ref: str | None = None) -> list[CollectEntry]:
         with self._lock:
-            for e in self._entries:
-                if e.entry_id == entry_id:
-                    e.validated = True
-                    e.quality_score = score
-                    return True
-            return False
+            return [
+                e for e in self._entries
+                if e.enrich_version > 0
+                and (batch_ref is None or e.batch_ref == batch_ref)
+            ]
+
+    def list_pending_revalidation(self, batch_ref: str | None = None) -> list[CollectEntry]:
+        with self._lock:
+            return [
+                e for e in self._entries
+                if e.validation_status == STATUS_PENDING_REVALIDATION
+                and (batch_ref is None or e.batch_ref == batch_ref)
+            ]
+
+    def apply_rewrite(
+        self,
+        entry_id: int,
+        updates: dict[str, Any],
+        *,
+        expected_version: int | None = None,
+        source: str = "data_enrich",
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """原子改写字段：同一个锁内完成改写、版本递增、校验失效、旧回执作废。
+
+        ``expected_version`` 用于并发控制：只有版本仍与调用方读到的一致才允许写入，
+        后到的写入直接判为版本冲突，不产生第二份可用的校验结论。
+        """
+        with self._lock:
+            entry = next(
+                (e for e in self._entries if e.entry_id == entry_id), None)
+            if entry is None:
+                return False, "采集记录不存在", None
+            if expected_version is not None and entry.enrich_version != expected_version:
+                # 后到的写入不落库，也不覆盖先到版本的字段和回执。
+                return False, TERMINAL_CONFLICT, entry.to_dict()
+
+            diff: dict[str, dict[str, Any]] = {}
+            for name, value in updates.items():
+                old = entry.fields.get(name)
+                if old != value:
+                    diff[name] = {"old": old, "new": value}
+            if not diff:
+                # 没有真正改写字段，就不允许动版本和校验状态。
+                return True, "无字段改写", entry.to_dict()
+
+            previous_version = entry.enrich_version
+            entry.enrich_version = previous_version + 1
+            entry.enriched_at = datetime.now(timezone.utc).isoformat()
+            entry.fields.update({name: change["new"] for name, change in diff.items()})
+            entry.rewritten_fields = list(diff)
+            entry.rewrite_diff = diff
+            entry.rewrite_history.append({
+                "version": entry.enrich_version,
+                "previous_version": previous_version,
+                "diff": {k: dict(v) for k, v in diff.items()},
+                "source": source,
+                "at": entry.enriched_at,
+            })
+
+            superseded: list[int] = []
+            if self._receipts is not None:
+                superseded = self._receipts.supersede_for_entry(
+                    entry_id, only_versions_lt=entry.enrich_version)
+            entry._reset_validation()
+            entry.validation_version = entry.enrich_version
+            entry.conflict = False
+            result = entry.to_dict()
+            result["previous_version"] = previous_version
+            result["superseded_receipts"] = superseded
+            return True, "字段已改写，旧校验结论已失效", result
+
+    def record_validation(
+        self,
+        entry_id: int,
+        passed: bool,
+        score: float,
+        *,
+        expected_version: int | None = None,
+        source: str = "initial",
+        rules_applied: list[dict[str, Any]] | None = None,
+        failures: list[dict[str, Any]] | None = None,
+        reason: str = "",
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """把校验结论写成绑定补全版本的回执；版本不匹配时拒绝落库。"""
+        with self._lock:
+            entry = next(
+                (e for e in self._entries if e.entry_id == entry_id), None)
+            if entry is None:
+                return False, "采集记录不存在", None
+            version = entry.enrich_version if expected_version is None else expected_version
+            if entry.enrich_version != version:
+                # 迟到的校验结论对应的是旧字段版本，直接拒收，不覆盖新版本状态。
+                return False, TERMINAL_CONFLICT, entry.to_dict()
+
+            receipt: EnrichValidationReceipt | None = None
+            if self._receipts is not None:
+                receipt = self._receipts.issue(
+                    entry_id=entry_id,
+                    batch_ref=entry.batch_ref,
+                    enrich_version=version,
+                    source=source,
+                    passed=passed,
+                    score=score,
+                    rules_applied=list(rules_applied or []),
+                    failures=list(failures or []),
+                    reason=reason,
+                    rewritten_fields=list(entry.rewritten_fields),
+                )
+            entry.validated = passed
+            entry.quality_score = score
+            entry.validation_version = version
+            entry.validation_receipt = receipt.to_dict() if receipt else None
+            entry.validation_status = (
+                STATUS_VALIDATED if passed else STATUS_REVALIDATION_FAILED
+            )
+            entry.conflict = False
+            return True, "校验回执已生成", entry.to_dict()
+
+    def mark_conflict(self, entry_id: int, *, preserve_receipt: bool = True) -> bool:
+        """并发/版本冲突终态：冲突记录不得保留任何“通过”结论。"""
+        with self._lock:
+            entry = next(
+                (e for e in self._entries if e.entry_id == entry_id), None)
+            if entry is None:
+                return False
+            entry.conflict = True
+            entry.validation_status = STATUS_CONFLICT
+            entry.validated = False
+            entry.quality_score = None
+            if not preserve_receipt and self._receipts is not None:
+                self._receipts.supersede_for_entry(entry_id)
+                entry.validation_receipt = None
+            return True
+
+    def mark_validated(self, entry_id: int, score: float = 1.0) -> bool:
+        """兼容旧调用：为当前版本补一份通过回执。
+
+        发生过补全且尚未二次校验的记录不会被直接标记为已验证。
+        """
+        with self._lock:
+            entry = next(
+                (e for e in self._entries if e.entry_id == entry_id), None)
+            if entry is None:
+                return False
+            if entry.validation_status == STATUS_PENDING_REVALIDATION:
+                return False
+        ok, _, _ = self.record_validation(
+            entry_id, True, score, source="initial",
+            reason="通过", rules_applied=[], failures=[])
+        return ok
+    def consistency_report(self, batch_ref: str | None = None) -> dict[str, Any]:
+        """核对业务清单与校验台账：是否存在旧字段配新校验分的情况。"""
+        with self._lock:
+            entries = [
+                e for e in self._entries
+                if batch_ref is None or e.batch_ref == batch_ref
+            ]
+            stale: list[dict[str, Any]] = []
+            for entry in entries:
+                receipt = None
+                if self._receipts is not None:
+                    receipt = self._receipts.active_for(entry.entry_id)
+                receipt_version = receipt.enrich_version if receipt else None
+                if entry.validated and (
+                    entry.validation_version != entry.enrich_version
+                    or (receipt is not None and receipt_version != entry.enrich_version)
+                ):
+                    stale.append({
+                        "entry_id": entry.entry_id,
+                        "batch_ref": entry.batch_ref,
+                        "enrich_version": entry.enrich_version,
+                        "validation_version": entry.validation_version,
+                        "receipt_version": receipt_version,
+                    })
+            return {
+                "count": len(entries),
+                "validated": sum(1 for e in entries if e.validated),
+                "pending_revalidation": sum(
+                    1 for e in entries
+                    if e.validation_status == STATUS_PENDING_REVALIDATION),
+                "conflicts": sum(1 for e in entries if e.conflict),
+                "stale_conclusions": stale,
+                "consistent": not stale,
+            }
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             validated = sum(1 for e in self._entries if e.validated)
+            enriched = sum(1 for e in self._entries if e.enrich_version > 0)
+            pending = sum(
+                1 for e in self._entries
+                if e.validation_status == STATUS_PENDING_REVALIDATION)
+            conflicts = sum(1 for e in self._entries if e.conflict)
             by_source: dict[str, int] = {}
             for e in self._entries:
                 by_source[e.source_module] = by_source.get(e.source_module, 0) + 1
@@ -271,6 +655,9 @@ class CollectRecordStore:
                 "total": len(self._entries),
                 "validated": validated,
                 "unvalidated": len(self._entries) - validated,
+                "enriched": enriched,
+                "pending_revalidation": pending,
+                "conflicts": conflicts,
                 "by_source": by_source,
             }
 
@@ -371,6 +758,8 @@ class Store:
         self.channel = DataChannel()
         self.dirty_vault = DirtyDataVault()
         self.collect_records = CollectRecordStore()
+        self.validation_receipts = ValidationReceiptStore()
+        self.collect_records.attach_receipt_store(self.validation_receipts)
         self.recovery = FailureRecovery()
 
     # ---- 基础数据操作 ----

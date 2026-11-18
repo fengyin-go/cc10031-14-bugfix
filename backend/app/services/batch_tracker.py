@@ -32,11 +32,26 @@ class BatchTrackerService(BaseModuleService):
             e for e in store.channel.snapshot(topic="rpa.validation_complete")
             if e.get("payload", {}).get("batch_ref") == batch_ref
         ]
+        revalidation_events = [
+            e for e in store.channel.snapshot(topic="rpa.revalidation_complete")
+            if e.get("payload", {}).get("batch_ref") == batch_ref
+        ]
+        consistency = store.collect_records.consistency_report(batch_ref)
         return {
             "batch_ref": batch_ref,
             "collected": len(collect_records),
             "dirty": len(dirty_records),
             "validated_events": len(validation_events),
+            "revalidation_events": len(revalidation_events),
+            "enriched": sum(1 for r in collect_records if r.enrich_version > 0),
+            "pending_revalidation": sum(
+                1 for r in collect_records
+                if r.validation_status == "待复验"),
+            "terminal_state": (
+                revalidation_events[-1]["payload"].get("terminal_state")
+                if revalidation_events else "待复验"
+            ),
+            "consistent": consistency["consistent"],
             "completion_rate": round(
                 len(collect_records) / max(len(collect_records) + len(dirty_records), 1), 2),
         }

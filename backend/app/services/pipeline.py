@@ -377,8 +377,17 @@ def pipeline_proxy_anti_block(proxy_id: int | None = None) -> PipelineResult:
 # 链路 5: data_enrich → result_verify 二次验证
 # ---------------------------------------------------------------------------
 
-def pipeline_enrich_verify(enrich_id: int | None = None) -> PipelineResult:
-    """数据补全 → 结果校验 二次验证链路。"""
+def pipeline_enrich_verify(enrich_id: int | None = None,
+                           batch_ref: str | None = None,
+                           mode: str = "incremental") -> PipelineResult:
+    """数据补全 → 结果校验 二次验证链路。
+
+    补全真正改写字段后，旧校验结论必须失效；链路随后载入补全后的明细数据集，
+    只重算被改写记录（或整批重校验），并把终态同步回批次台账与待办。
+    """
+    from app.services.data_enrich import DataEnrichService
+    from app.services.result_verify import ResultVerifyService
+
     result = PipelineResult(pipeline="data_enrich→result_verify", ok=True)
     vault = DirtyDataVault()
 
@@ -396,7 +405,33 @@ def pipeline_enrich_verify(enrich_id: int | None = None) -> PipelineResult:
             vault.isolate(ent, f"补全规则未生效: {ent.get('status')}", "data_enrich")
     result.data["enrich_active"] = sum(1 for e in enriches if e.get("status") == "已生效")
 
-    # 2) 结果校验（二次验证）
+    # 2) 补全执行：字段改写同时让旧校验状态失效
+    target_batch = batch_ref
+    if target_batch is None:
+        # 优先选有采集明细的批次，避免对空批次做无意义的二次校验。
+        batches = [b.get("批次编号") for b in store.rows("batch_tracker")
+                   if b.get("批次编号")]
+        for candidate in batches:
+            if store.collect_records.list_by_batch(candidate):
+                target_batch = candidate
+                break
+        if target_batch is None and batches:
+            target_batch = batches[0]
+    enriched_count = 0
+    batch_has_records = False
+    if target_batch:
+        batch_has_records = bool(store.collect_records.list_by_batch(target_batch))
+        enrich_service = DataEnrichService()
+        enrich_result = enrich_service.enrich_records(target_batch)
+        enriched_count = enrich_result["enriched"]
+        result.data["batch_ref"] = target_batch
+        result.data["enriched_records"] = enriched_count
+        result.data["pending_revalidation"] = enrich_result["pending_revalidation"]
+    else:
+        result.add_error("无可用批次执行补全")
+        result.ok = False
+
+    # 3) 结果校验（二次验证）
     verifies = store.rows("result_verify")
     if not verifies:
         result.add_error("无校验规则，二次验证无法执行")
@@ -406,8 +441,25 @@ def pipeline_enrich_verify(enrich_id: int | None = None) -> PipelineResult:
         result.add_step("result_verify", vf)
         if vf.get("status") != "已启用":
             vault.isolate(vf, f"二次验证规则未启用: {vf.get('status')}", "result_verify")
-    result.data["reverify_rules"] = len(verifies)
-    result.data["reverify_done"] = True
+    result.data["reverify_rules"] = sum(
+        1 for v in verifies if v.get("status") == "已启用")
+
+    if target_batch and batch_has_records and result.data["reverify_rules"]:
+        report = ResultVerifyService().revalidate_enriched(
+            target_batch, mode=mode)
+        result.data["reverify_done"] = bool(report.get("ok"))
+        result.data["terminal_state"] = report.get("terminal_state")
+        result.data["revalidated"] = report.get("revalidated", 0)
+        result.data["stale_conclusions"] = len(
+            report.get("consistency", {}).get("stale_conclusions", []))
+        if not report.get("ok"):
+            result.ok = False
+            result.add_error(
+                f"补全二次校验终态：{report.get('terminal_state')}")
+    else:
+        # 没有补全后的明细就没有可重算的记录，不能伪造一次“已完成”的结论。
+        result.data["reverify_done"] = False
+        result.data["terminal_state"] = "无待复验记录"
 
     result.dirty = vault.list_all()
     return result

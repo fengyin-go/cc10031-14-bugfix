@@ -79,5 +79,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 补全二次校验（14 号处理）
+
+数据补全会改写采集记录的字段，改写必须与校验状态失效同步发生：
+
+- 采集记录带 `enrich_version`（补全版本）；只有真正发生字段改写才递增，无改写不失效旧结论。
+- 字段改写在同一把锁内清空 `validated` 与 `quality_score`，并把旧校验回执置为
+  `superseded`；同一记录同一时刻最多一份生效回执，回执版本必须等于当前补全版本。
+- 结果校验提供两种可选处理方案，都保证报告里不存在“旧字段配新校验分”：
+  `incremental` 只重算实际被改写的记录，`full_batch` 整批换发当前版本回执。
+- 版本冲突（并发再次写入 / 迟到的旧版本校验结论）会改变 14 号处理终态为
+  `版本冲突`，且冲突记录不保留任何通过结论。
+- 终态与待办会同步回批次台账和任务队列；批次台账的 `校验状态` 记录
+  `已复验通过` / `复验未通过` / `版本冲突`。
+
+相关接口：
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /api/enrich/workbench?batch_ref=` | 按批次检索被改写字段、校验状态、补全版本 |
+| `POST /api/enrich/execute?batch_ref=` | 执行补全（改写 + 旧状态失效） |
+| `POST /api/enrich/revalidate?batch_ref=&mode=incremental\|full_batch` | 补全二次校验 |
+| `GET /api/enrich/revalidation-report?batch_ref=` | 结果校验台账，定位失败规则 |
+| `GET /api/validation-receipts?batch_ref=` | 校验回执台账（生效/作废） |
+| `POST /api/pipeline/enrich-verify?batch_ref=&mode=` | 补全 → 二次校验完整链路 |
+
+前端在「数据补全」与「结果校验」两个工作台页面底部嵌入了补全工作台面板，
+可按批次检索字段改写与校验状态，并直接执行增量/整批重验。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

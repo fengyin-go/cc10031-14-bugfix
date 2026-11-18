@@ -90,6 +90,11 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <EnrichVerificationPanel
+      v-if="meta.key === 'data_enrich' || meta.key === 'result_verify'"
+      :module-key="meta.key"
+    />
   </section>
 </template>
 
@@ -103,6 +108,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import EnrichVerificationPanel from '@/views/EnrichVerificationPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()

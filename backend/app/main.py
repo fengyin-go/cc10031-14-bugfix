@@ -71,6 +71,8 @@ def nodestats(module: str | None = Query(default=None)) -> dict[str, object]:
         },
         "dirty_vault": store.dirty_vault.snapshot(),
         "collect_records": store.collect_records.snapshot(),
+        "validation_receipts": store.validation_receipts.snapshot(),
+        "validation_consistency": store.collect_records.consistency_report(),
         "recovery": store.recovery.snapshot(),
     }
 
@@ -116,8 +118,18 @@ def collect_records(batch_ref: str | None = Query(default=None),
     return {
         "count": len(records),
         "records": [
-            {"id": e.entry_id, "batch": e.batch_ref, "fields": e.fields,
-             "validated": e.validated, "score": e.quality_score}
+            {
+                "id": e.entry_id,
+                "batch": e.batch_ref,
+                "fields": e.fields,
+                "validated": e.validated,
+                "score": e.quality_score,
+                "enrich_version": e.enrich_version,
+                "rewritten_fields": list(e.rewritten_fields),
+                "validation_status": e.validation_status,
+                "validation_version": e.validation_version,
+                "conflict": e.conflict,
+            }
             for e in records
         ],
     }
@@ -127,6 +139,75 @@ def collect_records(batch_ref: str | None = Query(default=None),
 def recovery_stats() -> dict[str, object]:
     """失败恢复状态查询。"""
     return store.recovery.snapshot()
+
+
+# ---- 数据补全 / 补全二次校验（14 号处理） ----
+
+@app.get("/api/enrich/workbench")
+def enrich_workbench(batch_ref: str | None = Query(default=None)) -> dict[str, object]:
+    """补全工作台：按批次检索被改写字段、当前校验状态和补全版本。"""
+    from app.services import DataEnrichService
+
+    return DataEnrichService().enrichment_workbench(batch_ref)
+
+
+@app.post("/api/enrich/execute")
+def enrich_execute(
+    batch_ref: str = Query(...),
+    rule_id: int | None = Query(default=None),
+) -> dict[str, object]:
+    """执行补全：字段改写与旧校验状态失效在同一把锁内发生。"""
+    from app.services import DataEnrichService
+
+    service = DataEnrichService()
+    result = service.enrich_records(batch_ref)
+    return {
+        "ok": True,
+        "batch_ref": batch_ref,
+        "rule_id": rule_id,
+        **result,
+        "workbench": service.enrichment_workbench(batch_ref),
+    }
+
+
+@app.post("/api/enrich/revalidate")
+def enrich_revalidate(
+    batch_ref: str = Query(...),
+    mode: str = Query(default="incremental"),
+) -> dict[str, object]:
+    """补全二次校验：只重算被改写记录，或整批重新校验。"""
+    from app.services import ResultVerifyService
+
+    return ResultVerifyService().revalidate_enriched(batch_ref, mode=mode)
+
+
+@app.get("/api/enrich/revalidation-report")
+def revalidation_report(batch_ref: str = Query(...)) -> dict[str, object]:
+    """结果校验工作台：定位具体失败规则与失败记录。"""
+    from app.services import ResultVerifyService
+
+    return ResultVerifyService().revalidation_report(batch_ref)
+
+
+@app.get("/api/validation-receipts")
+def validation_receipts(
+    batch_ref: str | None = Query(default=None),
+    entry_id: int | None = Query(default=None),
+) -> dict[str, object]:
+    """补全校验回执台账：同一记录只保留当前补全版本的生效回执。"""
+    if entry_id is not None:
+        receipts = store.validation_receipts.list_by_entry(entry_id)
+    elif batch_ref:
+        receipts = store.validation_receipts.list_by_batch(batch_ref)
+    else:
+        return store.validation_receipts.snapshot()
+    return {
+        "count": len(receipts),
+        "receipts": [r.to_dict() for r in receipts],
+        "effective": [
+            r.to_dict() for r in receipts if r.status == "effective"
+        ],
+    }
 
 
 @app.get("/api/runtime-sessions")
@@ -226,6 +307,19 @@ def pipeline_element_execution() -> dict[str, object]:
     """触发元素定位与自动化执行流程。"""
     result = runtime_session.consume_strategies_and_execute()
     return {"ok": True, "result": result}
+
+
+@app.post("/api/pipeline/enrich-verify")
+def pipeline_enrich_verify(
+    batch_ref: str | None = Query(default=None),
+    mode: str = Query(default="incremental"),
+) -> dict[str, object]:
+    """补全 → 二次校验链路：发生补全的记录不得沿用补全前的通过结论。"""
+    from app.services.pipeline import pipeline_enrich_verify as run_pipeline
+
+    result = run_pipeline(batch_ref=batch_ref, mode=mode)
+    return {"ok": result.ok, "report": result.summary,
+            "data": result.data, "errors": result.errors}
 
 
 # 资源路由含 /api/{module}，必须放在 health / overview 之后注册，
